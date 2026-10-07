@@ -1,0 +1,41 @@
+name: MACD 30m check
+
+# Every 30 minutes, Mon-Fri (UTC). Runs ~5 min after each 30m bar closes.
+on:
+  schedule:
+    - cron: "5,35 * * * 1-5"
+  workflow_dispatch: {}  # manual "Run workflow" button, for testing
+
+permissions:
+  contents: write  # to commit state-30m.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run MACD check (30m)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python macd_alert.py --timeframe 30m
+
+      - name: Save alert state
+        run: |
+          git config user.name "macd-bot"
+          git config user.email "macd-bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add state-30m.json
+          git diff --cached --quiet || git commit -m "update 30m alert state [skip ci]"
+          git push || git push
