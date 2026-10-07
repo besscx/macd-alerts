@@ -1,0 +1,41 @@
+name: MACD 4h check
+
+# Every 4 hours, Mon-Fri (UTC). Catches each closed 4h bar via dedupe state.
+on:
+  schedule:
+    - cron: "25 */4 * * 1-5"
+  workflow_dispatch: {}  # manual "Run workflow" button, for testing
+
+permissions:
+  contents: write  # to commit state-4h.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run MACD check (4h)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python macd_alert.py --timeframe 4h
+
+      - name: Save alert state
+        run: |
+          git config user.name "macd-bot"
+          git config user.email "macd-bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add state-4h.json
+          git diff --cached --quiet || git commit -m "update 4h alert state [skip ci]"
+          git push || git push
