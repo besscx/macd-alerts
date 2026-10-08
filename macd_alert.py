@@ -6,8 +6,11 @@ MACD(12,26,9) 金叉/死叉 alert bot — 100% free stack.
 - MACD       : computed locally with pandas (no paid library)
 - Alerts     : Telegram Bot API via plain urllib (no extra dependency)
 
-Monitors 30m bars and 4h bars (resampled from 1h bars) for:
-    QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA
+Monitors MACD crossovers per timeframe:
+    15m : APP, ASTS, COST
+    30m : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT, APP, ASTS, COST
+    4h  : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT
+(4h bars are resampled from 1h bars, anchored at 9:30 ET.)
 
 A signal fires only when the LAST FULLY CLOSED bar completes a
 crossover, so alerts never repaint. Each (symbol, timeframe, bar, signal)
@@ -16,17 +19,18 @@ alerts exactly once, tracked in state.json.
 Usage:
     python macd_alert.py --dry-run                 # print signals, send nothing
     python macd_alert.py                           # one check cycle, send via Telegram
+    python macd_alert.py --timeframe 15m           # check only the 15m timeframe
     python macd_alert.py --timeframe 30m           # check only the 30m timeframe
     python macd_alert.py --timeframe 4h            # check only the 4h timeframe
 
-Alert state is kept in state-30m.json / state-4h.json (one per timeframe),
-so each GitHub Actions workflow can commit its own file without conflicts.
+Alert state is kept in state-15m.json / state-30m.json / state-4h.json
+(one per timeframe), so each GitHub Actions workflow can commit its own
+file without conflicts.
 
 Configure credentials in config.json (see config.example.json) or via
 env vars TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Nothing is sent if the
 token/chat id are missing — the script just prints what it would send.
 """
-
 
 import argparse
 import json
@@ -48,12 +52,22 @@ CONFIG_FILE = BASE_DIR / "config.json"
 
 SYMBOLS = ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA"]
 
+# symbols monitored per timeframe
+TIMEFRAME_SYMBOLS = {
+    "15m": ["APP", "ASTS", "COST"],
+    "30m": ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA",
+            "SMH", "MSFT", "APP", "ASTS", "COST"],
+    "4h":  ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA",
+            "SMH", "MSFT"],
+}
+
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 MIN_BARS = 60          # need enough history for the EMAs to stabilise
 ET = ZoneInfo("America/New_York")
 
 # timeframe -> (yfinance interval, yfinance period, bar minutes, resample rule)
 TIMEFRAMES = {
+    "15m": {"interval": "15m", "period": "1mo", "minutes": 15, "resample": None},
     "30m": {"interval": "30m", "period": "1mo", "minutes": 30, "resample": None},
     "4h":  {"interval": "1h",  "period": "3mo", "minutes": 240,
             "resample": "4h"},  # 4h bars built from 1h bars, anchored at 9:30 ET
@@ -173,9 +187,9 @@ def run(dry_run=False, timeframes=None):
     states = {tf: load_state(BASE_DIR / f"state-{tf}.json") for tf in tfs}
     alerts = 0
 
-    for symbol in SYMBOLS:
-        for tf_name, tf_cfg in tfs.items():
-            state = states[tf_name]
+    for tf_name, tf_cfg in tfs.items():
+        state = states[tf_name]
+        for symbol in TIMEFRAME_SYMBOLS[tf_name]:
             key = symbol
             try:
                 df = fetch_bars(symbol, tf_cfg)
@@ -224,8 +238,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
                     help="print signals instead of sending to Telegram")
-    ap.add_argument("--timeframe", choices=["30m", "4h"], default=None,
-                    help="check only this timeframe (default: both)")
+    ap.add_argument("--timeframe", choices=["15m", "30m", "4h"], default=None,
+                    help="check only this timeframe (default: all)")
     args = ap.parse_args()
     run(dry_run=args.dry_run,
         timeframes=[args.timeframe] if args.timeframe else None)
