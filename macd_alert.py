@@ -1,20 +1,37 @@
 #!/usr/bin/env python3
 """
-MACD(12,26,9) 金叉/死叉 alert bot — 100% free stack.
+DDMM 底部买入 / 顶部卖出 alert bot — 100% free stack.
 
 - Price data : Yahoo Finance via yfinance (free, no API key)
-- MACD       : computed locally with pandas (no paid library)
+- DDMM       : computed locally with pandas (no paid library)
 - Alerts     : Telegram Bot API via plain urllib (no extra dependency)
 
-Monitors MACD crossovers per timeframe:
+This is a faithful port of the shared DDMM (Tongdaxin-style) formula
+(params 12/26/9). Per timeframe it monitors:
+
     15m : APP, ASTS, COST
     30m : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT, APP, ASTS, COST
     4h  : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT
 (4h bars are resampled from 1h bars, anchored at 9:30 ET.)
 
-A signal fires only when the LAST FULLY CLOSED bar completes a
-crossover, so alerts never repaint. Each (symbol, timeframe, bar, signal)
-alerts exactly once, tracked in state.json.
+Signal definitions (exactly as in the DDMM script):
+
+  底部买入 BOTTOM BUY — a three-step confirmation chain:
+    1. Bottom divergence (直接底背离 or 隔峰底背离): within the current
+       below-zero MACD-histogram segment, price makes a lower low than the
+       previous (or skip-one) segment's low, while DIFF makes a HIGHER low.
+    2. The next bar: DIFF turns back up toward zero by >= 1%
+       (底部结构). The FIRST such bar prints 底部买入.
+    3. If the structure later fails, the script prints 消失 (not alerted).
+
+  顶部卖出 TOP SELL — mirror image:
+    1. Top divergence (price higher high, DIFF lower high, DIFF > 0).
+    2. Next bar: DIFF turns down from its high by >= 1% (顶部结构).
+       The FIRST such bar prints 顶部卖出.
+
+A signal fires only on the LAST FULLY CLOSED bar, so alerts never
+repaint. Each (symbol, timeframe, bar, signal) alerts exactly once,
+tracked in state.json.
 
 Usage:
     python macd_alert.py --dry-run                 # print signals, send nothing
@@ -42,6 +59,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -49,8 +67,6 @@ import yfinance as yf
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
-
-SYMBOLS = ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA"]
 
 # symbols monitored per timeframe
 TIMEFRAME_SYMBOLS = {
@@ -61,15 +77,15 @@ TIMEFRAME_SYMBOLS = {
             "SMH", "MSFT"],
 }
 
-MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
-MIN_BARS = 60          # need enough history for the EMAs to stabilise
+DDMM_FAST, DDMM_SLOW, DDMM_SIGNAL = 12, 26, 9   # DDMM(12,26,9)
+MIN_BARS = 60          # need enough history for EMAs + divergence segments
 ET = ZoneInfo("America/New_York")
 
 # timeframe -> (yfinance interval, yfinance period, bar minutes, resample rule)
 TIMEFRAMES = {
     "15m": {"interval": "15m", "period": "1mo", "minutes": 15, "resample": None},
     "30m": {"interval": "30m", "period": "1mo", "minutes": 30, "resample": None},
-    "4h":  {"interval": "1h",  "period": "3mo", "minutes": 240,
+    "4h":  {"interval": "1h",  "period": "6mo", "minutes": 240,
             "resample": "4h"},  # 4h bars built from 1h bars, anchored at 9:30 ET
 }
 
@@ -126,29 +142,124 @@ def fetch_bars(symbol, tf_cfg):
     return df
 
 
-def add_macd(df):
-    close = df["Close"]
-    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
+# ---------------------------------------------------------------- DDMM port
+# Faithful translation of the shared Tongdaxin-style DDMM formula.
+# Naming follows the original script (pinyin), so each line can be
+# checked against the source.
+
+def _barslast(cond):
+    """Tongdaxin BARSLAST: bars since cond was last True (0 = true now).
+    NaN where cond was never True."""
+    c = cond.fillna(False).to_numpy(dtype=bool)
+    idx = np.arange(len(c))
+    last_true = np.maximum.accumulate(np.where(c, idx, -1))
+    out = np.full(len(c), np.nan)
+    ok = last_true >= 0
+    out[ok] = idx[ok] - last_true[ok]
+    return pd.Series(out, index=cond.index)
+
+
+def _ref_var(s, n):
+    """Tongdaxin REF(X, N) with a per-bar variable offset N."""
+    vals = s.to_numpy(dtype=float)
+    off = n.to_numpy(dtype=float)
+    out = np.full(len(s), np.nan)
+    valid = np.isfinite(off)
+    tgt = np.empty(len(s), dtype=np.int64)
+    tgt[valid] = np.arange(len(s))[valid] - np.round(off[valid]).astype(np.int64)
+    ok = valid & (tgt >= 0)
+    out[ok] = vals[tgt[ok]]
+    return pd.Series(out, index=s.index)
+
+
+def ddmm_signals(close, diff, dea):
+    """Core DDMM divergence/structure logic. Returns a DataFrame with
+    boolean columns ddmm_buy (底部买入) and ddmm_sell (顶部卖出)."""
+    hist = (diff - dea) * 2  # MACD histogram, same as the script's MACD
+
+    # N1/M1: bars since the histogram crossed below/above the zero axis
+    cross_down = (hist.shift(1) >= 0) & (hist < 0)
+    cross_up = (hist.shift(1) <= 0) & (hist > 0)
+    N1 = _barslast(cross_down)
+    M1 = _barslast(cross_up)
+
+    # Segment extremes: LLV/HHV over the current zero-axis segment,
+    # implemented as cumulative min/max within each segment.
+    seg_below = cross_down.cumsum()
+    seg_above = cross_up.cumsum()
+    CL1 = close.groupby(seg_below).cummin()
+    DIFL1 = diff.groupby(seg_below).cummin()
+    CH1 = close.groupby(seg_above).cummax()
+    DIFH1 = diff.groupby(seg_above).cummax()
+
+    # Previous-segment extremes via variable REF
+    CL2 = _ref_var(CL1, M1 + 1)
+    CL3 = _ref_var(CL2, M1 + 1)
+    DIFL2 = _ref_var(DIFL1, M1 + 1)
+    DIFL3 = _ref_var(DIFL2, M1 + 1)
+    CH2 = _ref_var(CH1, N1 + 1)
+    CH3 = _ref_var(CH2, N1 + 1)
+    DIFH2 = _ref_var(DIFH1, N1 + 1)
+    DIFH3 = _ref_var(DIFH2, N1 + 1)
+
+    prev_hist_neg = hist.shift(1) < 0
+    prev_hist_pos = hist.shift(1) > 0
+
+    # ---- bottom divergence ----
+    direct_bull = (CL1 < CL2) & (DIFL1 > DIFL2) & prev_hist_neg & (diff < 0)
+    skip_bull = ((CL1 < CL3) & (DIFL1 < DIFL2) & (DIFL1 > DIFL3)
+                 & prev_hist_neg & (diff < 0))
+    bull_div = (direct_bull | skip_bull) & (diff < 0)          # 底部背离
+    # 底部结构: divergence held yesterday AND DIFF turns up >= 1% toward zero
+    bull_struct = (bull_div.shift(1).fillna(False)
+                   & (diff.shift(1).abs() >= diff.abs() * 1.01))
+    bull_buy = (~bull_struct.shift(1).fillna(False)) & bull_struct  # 底结构形成
+
+    # ---- top divergence (mirror) ----
+    direct_bear = (CH1 > CH2) & (DIFH1 < DIFH2) & prev_hist_pos & (diff > 0)
+    skip_bear = ((CH1 > CH3) & (DIFH1 > DIFH2) & (DIFH1 < DIFH3)
+                 & prev_hist_pos & (diff > 0))
+    bear_div = (direct_bear | skip_bear) & (diff > 0)         # 顶部背离
+    # 顶部结构: divergence held yesterday AND DIFF turns down >= 1%
+    bear_struct = (bear_div.shift(1).fillna(False)
+                   & (diff.shift(1) >= diff * 1.01))
+    bear_sell = (~bear_struct.shift(1).fillna(False)) & bear_struct  # 顶结构形成
+
+    return pd.DataFrame({"ddmm_buy": bull_buy.fillna(False),
+                         "ddmm_sell": bear_sell.fillna(False)},
+                        index=close.index)
+
+
+def add_ddmm(df, fast=DDMM_FAST, slow=DDMM_SLOW, m=DDMM_SIGNAL):
+    """Attach DIFF/DEA/histogram plus ddmm_buy / ddmm_sell signals."""
     df = df.copy()
-    df["macd"] = ema_fast - ema_slow
-    df["signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
+    close = df["Close"]
+    diff = (close.ewm(span=fast, adjust=False).mean()
+            - close.ewm(span=slow, adjust=False).mean())
+    dea = diff.ewm(span=m, adjust=False).mean()
+    df["ddmm_diff"] = diff
+    df["ddmm_dea"] = dea
+    df["ddmm_hist"] = (diff - dea) * 2
+    sig = ddmm_signals(close, diff, dea)
+    df["ddmm_buy"] = sig["ddmm_buy"]
+    df["ddmm_sell"] = sig["ddmm_sell"]
     return df
 
 
-def detect_cross(df):
-    """Return 'golden' (金叉), 'death' (死叉) or None, based on the last
-    two closed bars: MACD line crossing the signal line."""
-    if len(df) < 2:
+def detect_ddmm(df):
+    """Return 'bottom_buy' (底部买入), 'top_sell' (顶部卖出) or None,
+    based on the last fully closed bar."""
+    if len(df) < 1:
         return None
-    prev = df["macd"].iloc[-2] - df["signal"].iloc[-2]
-    curr = df["macd"].iloc[-1] - df["signal"].iloc[-1]
-    if prev <= 0 < curr:
-        return "golden"
-    if prev >= 0 > curr:
-        return "death"
+    last = df.iloc[-1]
+    if bool(last["ddmm_buy"]):
+        return "bottom_buy"
+    if bool(last["ddmm_sell"]):
+        return "top_sell"
     return None
 
+
+# ---------------------------------------------------------------- alerts
 
 def send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -159,17 +270,18 @@ def send_telegram(token, chat_id, text):
         return resp.status == 200
 
 
-def format_message(symbol, timeframe, signal, price, macd, sig, bar_open, bar_minutes):
-    if signal == "golden":
-        head = "🟢 *金叉 GOLDEN CROSS*"
+def format_message(symbol, timeframe, signal, price, diff, dea,
+                   bar_open, bar_minutes):
+    if signal == "bottom_buy":
+        head = "🟢 *底部买入 BOTTOM BUY* (DDMM)"
     else:
-        head = "🔴 *死叉 DEATH CROSS*"
+        head = "🔴 *顶部卖出 TOP SELL* (DDMM)"
     day_close = bar_open.floor("D") + pd.Timedelta(hours=16)
     bar_close = min(bar_open + pd.Timedelta(minutes=bar_minutes), day_close)
     return (f"{head}\n"
             f"*{symbol}* · {timeframe}\n"
             f"Price: {price:.2f}\n"
-            f"MACD: {macd:.4f} / Signal: {sig:.4f}\n"
+            f"DIFF: {diff:.4f} / DEA: {dea:.4f}\n"
             f"Bar closed: {bar_close:%Y-%m-%d %H:%M} ET")
 
 
@@ -200,15 +312,15 @@ def run(dry_run=False, timeframes=None):
                 print(f"[{symbol} {tf_name}] not enough history ({len(df)} bars), skipped")
                 continue
 
-            df = add_macd(df)
-            signal = detect_cross(df)
+            df = add_ddmm(df)
+            signal = detect_ddmm(df)
             bar_time = df.index[-1]
             state_key = f"{key}|{bar_time.isoformat()}|{signal}"
 
             if signal and state.get(key) != state_key:
                 row = df.iloc[-1]
                 msg = format_message(symbol, tf_name, signal, float(row["Close"]),
-                                     float(row["macd"]), float(row["signal"]),
+                                     float(row["ddmm_diff"]), float(row["ddmm_dea"]),
                                      bar_time, tf_cfg["minutes"])
                 if dry_run:
                     print(f"[DRY-RUN] would send:\n{msg}\n")
