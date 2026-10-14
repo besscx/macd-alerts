@@ -9,9 +9,11 @@ DDMM 底部买入 / 顶部卖出 alert bot — 100% free stack.
 This is a faithful port of the shared DDMM (Tongdaxin-style) formula
 (params 12/26/9). Per timeframe it monitors:
 
-    15m : APP, ASTS, COST
-    30m : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT, APP, ASTS, COST
-    4h  : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT
+    15m : APP, COST, QQQ, VOO, SMH
+    30m : QQQ, SPY, META, AAPL, AMZN, TSLA, NVDA, SMH, MSFT, APP, COST
+    4h  : QQQ, SPY, SMH + NDX_QUALITY_4H (Nasdaq-100 names passing the
+          fundamental screen: TTM EPS > 0, FCF > 0, D/E <= 300;
+          see screen_ndx_fundamentals.py; 2026-10-14: 85 pass / 16 excluded)
 (4h bars are resampled from 1h bars, anchored at 9:30 ET.)
 
 Signal definitions (exactly as in the DDMM script):
@@ -68,13 +70,31 @@ import yfinance as yf
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 
+# Nasdaq-100 constituents passing the fundamental screen
+# (TTM EPS > 0, FCF > 0, D/E <= 300; screened 2026-10-14 via
+# screen_ndx_fundamentals.py — 85 pass, 16 excluded: unprofitable
+# CRWV/GILD/INTC/LITE/MRNA/MSTR/RKLB/SPCX/TTWO, cash-burning
+# AEP/CEG/EXC/NBIS/XEL, extreme leverage AMGN, missing data HONA)
+NDX_QUALITY_4H = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "ALAB", "ALNY",
+    "AMAT", "AMD", "AMZN", "APP", "ARM", "ASML", "AVGO", "AXON",
+    "BKNG", "BKR", "CCEP", "CDNS", "CMCSA", "COST", "CPRT", "CRWD",
+    "CSCO", "CSX", "CTAS", "DASH", "DDOG", "DXCM", "FANG", "FAST",
+    "FER", "FTNT", "GEHC", "GOOG", "GOOGL", "HON", "IDXX", "INTU",
+    "ISRG", "KDP", "KLAC", "LIN", "LRCX", "MAR", "MCHP", "MDLZ",
+    "MELI", "META", "MNST", "MPWR", "MRVL", "MSFT", "MU", "NFLX",
+    "NVDA", "NXPI", "ODFL", "ORLY", "PANW", "PAYX", "PCAR", "PDD",
+    "PEP", "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX",
+    "SHOP", "SNDK", "SNPS", "STX", "TER", "TMUS", "TRI", "TSLA",
+    "TXN", "VRTX", "WDAY", "WDC", "WMT",
+]
+
 # symbols monitored per timeframe
 TIMEFRAME_SYMBOLS = {
-    "15m": ["APP", "ASTS", "COST"],
+    "15m": ["APP", "COST", "QQQ", "VOO", "SMH"],
     "30m": ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA",
-            "SMH", "MSFT", "APP", "ASTS", "COST"],
-    "4h":  ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA",
-            "SMH", "MSFT"],
+            "SMH", "MSFT", "APP", "COST"],
+    "4h":  sorted(set(["QQQ", "SPY", "SMH"]) | set(NDX_QUALITY_4H)),
 }
 
 DDMM_FAST, DDMM_SLOW, DDMM_SIGNAL = 12, 26, 9   # DDMM(12,26,9)
