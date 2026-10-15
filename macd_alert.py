@@ -14,6 +14,8 @@ This is a faithful port of the shared DDMM (Tongdaxin-style) formula
     4h  : QQQ, SPY, SMH + NDX_QUALITY_4H (Nasdaq-100 names passing the
           fundamental screen: TTM EPS > 0, FCF > 0, D/E <= 300;
           see screen_ndx_fundamentals.py; 2026-10-14: 85 pass / 16 excluded)
+          + BLUECHIP_4H (Xi's hand-picked large-cap non-Nasdaq blue chips:
+          2026-10-14: JNJ, V, MA, LLY, KO, JPM, CAT)
 (4h bars are resampled from 1h bars, anchored at 9:30 ET.)
 
 Signal definitions (exactly as in the DDMM script):
@@ -89,12 +91,16 @@ NDX_QUALITY_4H = [
     "TXN", "VRTX", "WDAY", "WDC", "WMT",
 ]
 
+# Xi's hand-picked large-cap blue chips outside Nasdaq-100 (added 2026-10-14)
+BLUECHIP_4H = ["JNJ", "V", "MA", "LLY", "KO", "JPM", "CAT"]
+
 # symbols monitored per timeframe
 TIMEFRAME_SYMBOLS = {
     "15m": ["APP", "COST", "QQQ", "VOO", "SMH"],
     "30m": ["QQQ", "SPY", "META", "AAPL", "AMZN", "TSLA", "NVDA",
             "SMH", "MSFT", "APP", "COST"],
-    "4h":  sorted(set(["QQQ", "SPY", "SMH"]) | set(NDX_QUALITY_4H)),
+    "4h":  sorted(set(["QQQ", "SPY", "SMH"]) | set(NDX_QUALITY_4H)
+                  | set(BLUECHIP_4H)),
 }
 
 DDMM_FAST, DDMM_SLOW, DDMM_SIGNAL = 12, 26, 9   # DDMM(12,26,9)
