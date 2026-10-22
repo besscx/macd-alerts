@@ -43,10 +43,13 @@ Usage:
     python macd_alert.py --timeframe 15m           # check only the 15m timeframe
     python macd_alert.py --timeframe 30m           # check only the 30m timeframe
     python macd_alert.py --timeframe 4h            # check only the 4h timeframe
+    python macd_alert.py --fear-greed             # hourly CNN Fear & Greed check
 
 Alert state is kept in state-15m.json / state-30m.json / state-4h.json
 (one per timeframe), so each GitHub Actions workflow can commit its own
-file without conflicts.
+file without conflicts. The CNN Fear & Greed check keeps its own
+state-fear-greed.json the same way, and alerts exactly once per entry
+into Extreme Fear (re-armed automatically when the rating exits it).
 
 Configure credentials in config.json (see config.example.json) or via
 env vars TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Nothing is sent if the
@@ -311,6 +314,147 @@ def format_message(symbol, timeframe, signal, price, diff, dea,
             f"Bar closed: {bar_close:%Y-%m-%d %H:%M} ET")
 
 
+# ---------------------------------------------------------------- CNN Fear & Greed
+
+# CNN's own dataviz endpoint (no API key). Payload shape, as used by
+# multiple public clients of this endpoint:
+#   {"fear_and_greed": {"score": int, "rating": str, "timestamp": ...},
+#    "fear_and_greed_historical": {"data": [{"x": ms_epoch, "y": score}]}}
+# The endpoint rejects bare programmatic clients (HTTP 418 without a
+# browser User-Agent), so fetch with a browser UA header.
+CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+CNN_FEAR_GREED_STATE = "state-fear-greed.json"
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/130.0.0.0 Safari/537.36")
+
+
+def _band_from_score(score):
+    if score is None:
+        return None
+    if score <= 24:
+        return "Extreme Fear"
+    if score <= 44:
+        return "Fear"
+    if score <= 55:
+        return "Neutral"
+    if score <= 74:
+        return "Greed"
+    return "Extreme Greed"
+
+
+def _normalize_rating(rating, score):
+    if rating:
+        rating = " ".join(w.capitalize() for w in str(rating).lower().split())
+        if rating:
+            return rating
+    return _band_from_score(score)
+
+
+def _format_cnn_timestamp(ts):
+    if ts is None:
+        return None
+    try:
+        v = float(ts)
+        if v > 1e12:  # epoch ms -> s
+            v /= 1000.0
+        return datetime.fromtimestamp(v, tz=ET).strftime("%Y-%m-%d %H:%M ET")
+    except (TypeError, ValueError):
+        return str(ts)
+
+
+def parse_cnn_payload(data):
+    """Extract (score, rating, updated_str) from CNN's payload.
+
+    Prefers the current fear_and_greed object; falls back to the last
+    point of the historical series (which tracks the current reading).
+    Raises ValueError when no usable score is present.
+    """
+    score, rating, ts = None, None, None
+    current = data.get("fear_and_greed") or {}
+    if isinstance(current, dict):
+        score = current.get("score")
+        rating = current.get("rating")
+        ts = current.get("timestamp")
+    if score is None:
+        hist = (data.get("fear_and_greed_historical") or {}).get("data") or []
+        if hist:
+            last = hist[-1]
+            score = last.get("y")
+            ts = last.get("x")
+    if score is None:
+        raise ValueError("CNN payload has no usable score")
+    score = int(round(float(score)))
+    return score, _normalize_rating(rating, score), _format_cnn_timestamp(ts)
+
+
+def fetch_cnn_fear_greed():
+    """Fetch CNN's Fear & Greed Index; return (score, rating, updated)."""
+    req = urllib.request.Request(CNN_FEAR_GREED_URL,
+                                 headers={"User-Agent": BROWSER_UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return parse_cnn_payload(data)
+
+
+def check_fear_greed(dry_run=False):
+    """Hourly CNN Fear & Greed check. Alerts exactly once per entry
+    into Extreme Fear; re-arms automatically when the rating exits it.
+    A failed fetch leaves state untouched so the next hour retries."""
+    token, chat_id = load_config()
+    can_send = bool(token and chat_id)
+    if not can_send and not dry_run:
+        print("No Telegram credentials configured — running in dry-run mode.")
+        dry_run = True
+
+    state_path = BASE_DIR / CNN_FEAR_GREED_STATE
+    state = load_state(state_path)
+    try:
+        score, rating, updated = fetch_cnn_fear_greed()
+    except Exception as e:  # noqa: BLE001 — a failed fetch must not touch state
+        print(f"[fear-greed] fetch failed ({e}) — state unchanged",
+              file=sys.stderr)
+        return 0
+
+    prev_score = state.get("last_score")
+    prev_rating = state.get("last_rating")
+    prev_extreme = (prev_rating == "Extreme Fear"
+                    or (isinstance(prev_score, (int, float))
+                        and prev_score <= 24))
+    now_extreme = (rating == "Extreme Fear" or score <= 24)
+
+    prev_txt = (f" — previous: {prev_score} ({prev_rating})"
+                if prev_score is not None else " — first reading")
+    upd_txt = f" — updated {updated}" if updated else ""
+    print(f"[fear-greed] CNN Fear & Greed: {score} ({rating}){upd_txt}{prev_txt}")
+
+    if now_extreme and not prev_extreme:
+        msg = (f"🚨 *CNN 恐慌指数进入 Extreme Fear*\n"
+               f"当前：{score} / 100（{rating}）\n")
+        if prev_score is not None:
+            msg += f"上一读数：{prev_score}（{prev_rating}）\n"
+        if updated:
+            msg += f"更新时间：{updated}"
+        if dry_run:
+            print(f"[DRY-RUN] would send:\n{msg}\n")
+        else:
+            try:
+                if send_telegram(token, chat_id, msg):
+                    print("[fear-greed] alert sent")
+                else:
+                    print("[fear-greed] send failed", file=sys.stderr)
+                    return 0  # do not advance state; retry next hour
+            except Exception as e:  # noqa: BLE001
+                print(f"[fear-greed] send error: {e}", file=sys.stderr)
+                return 0  # do not advance state; retry next hour
+    else:
+        print("[fear-greed] no alert (not a new entry into Extreme Fear)")
+
+    if not dry_run:
+        save_state(state_path, {"last_score": score, "last_rating": rating})
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def run(dry_run=False, timeframes=None):
@@ -378,6 +522,10 @@ if __name__ == "__main__":
                     help="print signals instead of sending to Telegram")
     ap.add_argument("--timeframe", choices=["15m", "30m", "4h"], default=None,
                     help="check only this timeframe (default: all)")
+    ap.add_argument("--fear-greed", action="store_true",
+                    help="check only the CNN Fear & Greed Index (hourly job)")
     args = ap.parse_args()
+    if args.fear_greed:
+        raise SystemExit(check_fear_greed(dry_run=args.dry_run))
     run(dry_run=args.dry_run,
         timeframes=[args.timeframe] if args.timeframe else None)
