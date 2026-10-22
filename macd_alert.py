@@ -320,13 +320,19 @@ def format_message(symbol, timeframe, signal, price, diff, dea,
 # multiple public clients of this endpoint:
 #   {"fear_and_greed": {"score": int, "rating": str, "timestamp": ...},
 #    "fear_and_greed_historical": {"data": [{"x": ms_epoch, "y": score}]}}
-# The endpoint rejects bare programmatic clients (HTTP 418 without a
-# browser User-Agent), so fetch with a browser UA header.
+# The endpoint rejects bare programmatic clients (HTTP 418), so fetch
+# with the small header set a browser would send from CNN's index page.
 CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 CNN_FEAR_GREED_STATE = "state-fear-greed.json"
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/130.0.0.0 Safari/537.36")
+CNN_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cnn.com/markets/fear-and-greed",
+}
 
 
 def _band_from_score(score):
@@ -390,8 +396,7 @@ def parse_cnn_payload(data):
 
 def fetch_cnn_fear_greed():
     """Fetch CNN's Fear & Greed Index; return (score, rating, updated)."""
-    req = urllib.request.Request(CNN_FEAR_GREED_URL,
-                                 headers={"User-Agent": BROWSER_UA})
+    req = urllib.request.Request(CNN_FEAR_GREED_URL, headers=CNN_HEADERS)
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return parse_cnn_payload(data)

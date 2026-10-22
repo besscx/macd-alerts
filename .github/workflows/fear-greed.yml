@@ -38,6 +38,8 @@ jobs:
           git config user.name "macd-bot"
           git config user.email "macd-bot@users.noreply.github.com"
           git pull --rebase --autostash || true
-          git add state-fear-greed.json
+          # tolerate a missing state file (e.g. the run hit a fetch
+          # failure and created nothing) instead of failing the run
+          git add state-fear-greed.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "update fear-greed alert state [skip ci]"
           git push || git push
