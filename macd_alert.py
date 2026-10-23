@@ -33,9 +33,14 @@ Signal definitions (exactly as in the DDMM script):
     2. Next bar: DIFF turns down from its high by >= 1% (顶部结构).
        The FIRST such bar prints 顶部卖出.
 
-A signal fires only on the LAST FULLY CLOSED bar, so alerts never
+A signal is evaluated on FULLY CLOSED bars only, so alerts never
 repaint. Each (symbol, timeframe, bar, signal) alerts exactly once,
-tracked in state.json.
+tracked in state.json. Since 2026-10-23 each run scans every closed bar
+newer than the last evaluated bar (a backfill cursor per symbol), so a
+run delayed past a bar's window still catches that bar's signal instead
+of skipping it (the 2026-10-22 SPY 15:00 ET miss: no run landed in the
+15:30-16:00 ET window, and the old code only ever looked at the last
+bar).
 
 Usage:
     python macd_alert.py --dry-run                 # print signals, send nothing
@@ -488,12 +493,52 @@ def run(dry_run=False, timeframes=None):
                 continue
 
             df = add_ddmm(df)
-            signal = detect_ddmm(df)
-            bar_time = df.index[-1]
-            state_key = f"{key}|{bar_time.isoformat()}|{signal}"
+            # Backfill cursor: the last closed bar this symbol has been
+            # evaluated through. Every closed bar newer than the cursor
+            # is scanned in order, so a run delayed past a bar's window
+            # still catches that bar's signal (old code only ever looked
+            # at the last bar, which is how SPY 2026-10-22 15:00 ET was
+            # skipped: no run landed in the 15:30-16:00 ET window).
+            cursor_key = f"{key}|cursor"
+            cursor = None
+            cursor_raw = state.get(cursor_key)
+            if cursor_raw:
+                try:
+                    cursor = datetime.fromisoformat(cursor_raw)
+                    if cursor.tzinfo is None:
+                        cursor = cursor.replace(tzinfo=ET)
+                except ValueError:
+                    cursor = None
+            if cursor is None:
+                # First run with backfill: scan only the last 2 bars, so
+                # deploy neither floods stale alerts nor swallows a
+                # just-closed signal.
+                scan = df.iloc[-2:]
+                scan_floor = df.index[-3] if len(df) >= 3 else None
+                print(f"[{symbol} {tf_name}] backfill baseline: scanning last "
+                      f"{len(scan)} bar(s)")
+            else:
+                scan = df[df.index > cursor]
+                scan_floor = cursor
+                if len(scan) == 0:
+                    print(f"[{symbol} {tf_name}] no new bars "
+                          f"(last closed bar {df.index[-1]:%m-%d %H:%M})")
+                    continue
 
-            if signal and state.get(key) != state_key:
-                row = df.iloc[-1]
+            last_done = scan_floor
+            failed = False
+            for bar_time, row in scan.iterrows():
+                if bool(row["ddmm_buy"]):
+                    signal = "bottom_buy"
+                elif bool(row["ddmm_sell"]):
+                    signal = "top_sell"
+                else:
+                    last_done = bar_time
+                    continue
+                state_key = f"{key}|{bar_time.isoformat()}|{signal}"
+                if state.get(key) == state_key:
+                    last_done = bar_time  # already alerted for this bar
+                    continue
                 msg = format_message(symbol, tf_name, signal, float(row["Close"]),
                                      float(row["ddmm_diff"]), float(row["ddmm_dea"]),
                                      bar_time, tf_cfg["minutes"])
@@ -501,19 +546,25 @@ def run(dry_run=False, timeframes=None):
                     print(f"[DRY-RUN] would send:\n{msg}\n")
                 else:
                     try:
-                        if send_telegram(token, chat_id, msg):
-                            print(f"[{symbol} {tf_name}] alert sent: {signal} @ {bar_time:%H:%M}")
-                        else:
-                            print(f"[{symbol} {tf_name}] send failed", file=sys.stderr)
-                            continue  # retry next run
+                        sent = send_telegram(token, chat_id, msg)
                     except Exception as e:  # noqa: BLE001
                         print(f"[{symbol} {tf_name}] send error: {e}", file=sys.stderr)
-                        continue  # retry next run
+                        sent = False
+                    if sent:
+                        print(f"[{symbol} {tf_name}] alert sent: {signal} @ {bar_time:%H:%M}")
+                    else:
+                        print(f"[{symbol} {tf_name}] send failed", file=sys.stderr)
+                        # Stop here: keep the cursor before this bar so
+                        # the next run retries it instead of skipping it.
+                        failed = True
+                        break
                 state[key] = state_key
                 alerts += 1
-            else:
-                print(f"[{symbol} {tf_name}] no new signal "
-                      f"(last closed bar {bar_time:%m-%d %H:%M})")
+                last_done = bar_time
+            if not failed:
+                state[cursor_key] = df.index[-1].isoformat()
+            elif last_done is not None:
+                state[cursor_key] = last_done.isoformat()
 
     if not dry_run:
         for tf_name, state in states.items():
