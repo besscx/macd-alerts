@@ -42,4 +42,15 @@ jobs:
           # failure and created nothing) instead of failing the run
           git add state-fear-greed.json 2>/dev/null || true
           git diff --cached --quiet || git commit -m "update fear-greed alert state [skip ci]"
-          git push || git push
+          # Concurrent workflows (15m/30m/4h/fear-greed) all push state
+          # files to main, so a push can be rejected because another
+          # workflow landed first. Re-pull + rebase and retry instead
+          # of failing the run; the state files are disjoint, so the
+          # rebase is normally conflict-free.
+          for i in 1 2 3 4 5; do
+            if git push; then break; fi
+            echo "push rejected, re-pulling and retrying ($i/5)"
+            git pull --rebase --autostash || git rebase --abort 2>/dev/null || true
+            sleep 5
+          done
+          git push
