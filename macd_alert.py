@@ -4,7 +4,15 @@ DDMM 底部买入 / 顶部卖出 alert bot — 100% free stack.
 
 - Price data : Yahoo Finance via yfinance (free, no API key)
 - DDMM       : computed locally with pandas (no paid library)
-- Alerts     : Telegram Bot API via plain urllib (no extra dependency)
+- Alerts     : Telegram Bot API + Bark (https://api.day.app) via plain
+               urllib (no extra dependency). Both fire on the same
+               signal; Telegram stays as-is, Bark is the channel that
+               reaches an iPhone in mainland China (APNs, no VPN).
+               Bark is best-effort: a Bark failure is logged but never
+               blocks the Telegram send or the state cursor, so a
+               retry never duplicates the Telegram alert. If Telegram
+               is not configured, Bark alone becomes the primary
+               channel and its failure does block the cursor (retry).
 
 This is a faithful port of the shared DDMM (Tongdaxin-style) formula
 (params 12/26/9). Per timeframe it monitors:
@@ -57,8 +65,10 @@ state-fear-greed.json the same way, and alerts exactly once per entry
 into Extreme Fear (re-armed automatically when the rating exits it).
 
 Configure credentials in config.json (see config.example.json) or via
-env vars TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. Nothing is sent if the
-token/chat id are missing — the script just prints what it would send.
+env vars TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / BARK_KEY
+(optional BARK_SERVER, default https://api.day.app). Nothing is sent
+if neither channel is configured — the script just prints what it
+would send.
 """
 
 import argparse
@@ -131,7 +141,11 @@ def load_config():
         cfg = json.loads(CONFIG_FILE.read_text())
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or cfg.get("telegram_bot_token", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID") or cfg.get("telegram_chat_id", "")
-    return token.strip(), str(chat_id).strip()
+    bark_key = os.environ.get("BARK_KEY") or cfg.get("bark_key", "")
+    bark_server = (os.environ.get("BARK_SERVER") or cfg.get("bark_server", "")
+                   or "https://api.day.app")
+    return (token.strip(), str(chat_id).strip(),
+            bark_key.strip(), bark_server.strip().rstrip("/"))
 
 
 def load_state(path):
@@ -304,6 +318,60 @@ def send_telegram(token, chat_id, text):
         return resp.status == 200
 
 
+def send_bark(server, key, title, body):
+    """POST one push to Bark (POST https://api.day.app/<key>, JSON
+    {"title", "body", ...} — Bark tutorial format). Returns True only
+    on HTTP 200 with Bark code 200. Raises on transport errors so the
+    caller can log them; a bad/unknown key returns False, not a raise.
+    level=timeSensitive: shows in Focus mode, does not ring in silent
+    mode (unlike critical)."""
+    url = f"{server}/{key}"
+    payload = json.dumps({
+        "title": title, "body": body,
+        "group": "DDMM", "level": "timeSensitive",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if resp.status != 200:
+            return False
+        try:
+            return json.loads(resp.read().decode("utf-8")).get("code", 200) == 200
+        except (ValueError, AttributeError):
+            return True
+
+
+def deliver_alert(token, chat_id, bark_server, bark_key,
+                  tg_text, bark_title, bark_body, label=""):
+    """Send one alert on every configured channel.
+
+    Returns True when the primary channel succeeded. Telegram is
+    primary when configured; Bark alone is primary when Telegram is
+    not. A Bark failure alongside a Telegram success is logged and
+    does NOT fail the delivery, so the state cursor still advances
+    and the next run does not re-send the Telegram copy.
+    Returns (ok, bark_ok_or_None)."""
+    tg_ok, bark_ok = None, None
+    if token and chat_id:
+        try:
+            tg_ok = send_telegram(token, chat_id, tg_text)
+        except Exception as e:  # noqa: BLE001
+            print(f"{label} telegram send error: {e}", file=sys.stderr)
+            tg_ok = False
+    if bark_key:
+        try:
+            bark_ok = send_bark(bark_server, bark_key, bark_title, bark_body)
+            if not bark_ok:
+                print(f"{label} bark send failed (bad key or server "
+                      f"rejected it)", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"{label} bark send error: {e}", file=sys.stderr)
+            bark_ok = False
+    primary_ok = tg_ok if tg_ok is not None else bark_ok
+    return bool(primary_ok), bark_ok
+
+
 def format_message(symbol, timeframe, signal, price, diff, dea,
                    bar_open, bar_minutes):
     if signal == "bottom_buy":
@@ -317,6 +385,19 @@ def format_message(symbol, timeframe, signal, price, diff, dea,
             f"Price: {price:.2f}\n"
             f"DIFF: {diff:.4f} / DEA: {dea:.4f}\n"
             f"Bar closed: {bar_close:%Y-%m-%d %H:%M} ET")
+
+
+def format_bark(symbol, timeframe, signal, price, diff, dea,
+                bar_open, bar_minutes):
+    """Plain-text (title, body) for Bark — no Telegram Markdown."""
+    label = "底部买入" if signal == "bottom_buy" else "顶部卖出"
+    title = f"{symbol} {timeframe} {label}"
+    day_close = bar_open.floor("D") + pd.Timedelta(hours=16)
+    bar_close = min(bar_open + pd.Timedelta(minutes=bar_minutes), day_close)
+    body = (f"Price: {price:.2f}\n"
+            f"DIFF: {diff:.4f} / DEA: {dea:.4f}\n"
+            f"Bar closed: {bar_close:%Y-%m-%d %H:%M} ET")
+    return title, body
 
 
 # ---------------------------------------------------------------- CNN Fear & Greed
@@ -411,10 +492,10 @@ def check_fear_greed(dry_run=False):
     """Hourly CNN Fear & Greed check. Alerts exactly once per entry
     into Extreme Fear; re-arms automatically when the rating exits it.
     A failed fetch leaves state untouched so the next hour retries."""
-    token, chat_id = load_config()
-    can_send = bool(token and chat_id)
+    token, chat_id, bark_key, bark_server = load_config()
+    can_send = bool(token and chat_id) or bool(bark_key)
     if not can_send and not dry_run:
-        print("No Telegram credentials configured — running in dry-run mode.")
+        print("No Telegram/Bark credentials configured — running in dry-run mode.")
         dry_run = True
 
     state_path = BASE_DIR / CNN_FEAR_GREED_STATE
@@ -445,17 +526,24 @@ def check_fear_greed(dry_run=False):
             msg += f"上一读数：{prev_score}（{prev_rating}）\n"
         if updated:
             msg += f"更新时间：{updated}"
+        bark_title = "CNN 恐慌指数 Extreme Fear"
+        bark_body = f"当前：{score} / 100（{rating}）"
+        if prev_score is not None:
+            bark_body += f"\n上一读数：{prev_score}（{prev_rating}）"
+        if updated:
+            bark_body += f"\n更新时间：{updated}"
         if dry_run:
             print(f"[DRY-RUN] would send:\n{msg}\n")
+            if bark_key:
+                print(f"[DRY-RUN] would send Bark: {bark_title}\n{bark_body}\n")
         else:
-            try:
-                if send_telegram(token, chat_id, msg):
-                    print("[fear-greed] alert sent")
-                else:
-                    print("[fear-greed] send failed", file=sys.stderr)
-                    return 0  # do not advance state; retry next hour
-            except Exception as e:  # noqa: BLE001
-                print(f"[fear-greed] send error: {e}", file=sys.stderr)
+            sent, _ = deliver_alert(token, chat_id, bark_server, bark_key,
+                                    msg, bark_title, bark_body,
+                                    label="[fear-greed]")
+            if sent:
+                print("[fear-greed] alert sent")
+            else:
+                print("[fear-greed] send failed", file=sys.stderr)
                 return 0  # do not advance state; retry next hour
     else:
         print("[fear-greed] no alert (not a new entry into Extreme Fear)")
@@ -468,10 +556,10 @@ def check_fear_greed(dry_run=False):
 # ---------------------------------------------------------------- main
 
 def run(dry_run=False, timeframes=None):
-    token, chat_id = load_config()
-    can_send = bool(token and chat_id)
+    token, chat_id, bark_key, bark_server = load_config()
+    can_send = bool(token and chat_id) or bool(bark_key)
     if not can_send and not dry_run:
-        print("No Telegram credentials configured — running in dry-run mode.")
+        print("No Telegram/Bark credentials configured — running in dry-run mode.")
         dry_run = True
 
     tfs = {k: v for k, v in TIMEFRAMES.items()
@@ -542,14 +630,19 @@ def run(dry_run=False, timeframes=None):
                 msg = format_message(symbol, tf_name, signal, float(row["Close"]),
                                      float(row["ddmm_diff"]), float(row["ddmm_dea"]),
                                      bar_time, tf_cfg["minutes"])
+                bark_title, bark_body = format_bark(
+                    symbol, tf_name, signal, float(row["Close"]),
+                    float(row["ddmm_diff"]), float(row["ddmm_dea"]),
+                    bar_time, tf_cfg["minutes"])
                 if dry_run:
                     print(f"[DRY-RUN] would send:\n{msg}\n")
+                    if bark_key:
+                        print(f"[DRY-RUN] would send Bark: {bark_title}\n{bark_body}\n")
                 else:
-                    try:
-                        sent = send_telegram(token, chat_id, msg)
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[{symbol} {tf_name}] send error: {e}", file=sys.stderr)
-                        sent = False
+                    sent, _ = deliver_alert(
+                        token, chat_id, bark_server, bark_key,
+                        msg, bark_title, bark_body,
+                        label=f"[{symbol} {tf_name}]")
                     if sent:
                         print(f"[{symbol} {tf_name}] alert sent: {signal} @ {bar_time:%H:%M}")
                     else:
@@ -575,7 +668,7 @@ def run(dry_run=False, timeframes=None):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
-                    help="print signals instead of sending to Telegram")
+                    help="print signals instead of sending alerts")
     ap.add_argument("--timeframe", choices=["15m", "30m", "4h"], default=None,
                     help="check only this timeframe (default: all)")
     ap.add_argument("--fear-greed", action="store_true",
